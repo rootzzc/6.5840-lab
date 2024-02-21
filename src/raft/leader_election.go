@@ -38,10 +38,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.currentTerm < args.Term {
 		rf.state = Follower
+		rf.electionTimer.Reset(rf.getRandomElectionTimeout())
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	} else if rf.currentTerm == args.Term {
+		// candidate向同一个term下的node发送vote，出现split votes情况
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
@@ -67,7 +69,7 @@ type RequestAppendReply struct {
 	Success bool
 }
 
-// 响应leader的heartbeat
+// 响应leader的heartbeat（leader不会向自身发送heartbeat信号）
 func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -75,12 +77,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	if rf.currentTerm > args.Term {
-		return
-	} else if rf.currentTerm == args.Term {
-		reply.Success = true
-		rf.electionTimer.Reset(rf.getRandomElectionTimeout())
-	} else {
+	// 如果当前term低于leader的term，无条件变为follower
+	if rf.currentTerm <= args.Term {
 		reply.Success = true
 		rf.currentTerm = args.Term
 		rf.state = Follower
@@ -90,13 +88,15 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 	DPrintf("%v recevie heartbeat from %v term %v", rf.me, args.LeaderId, rf.currentTerm)
 }
 
-// leader send append to server
 func (rf *Raft) sendAppendEntries(server int, args *RequestAppendArgs, reply *RequestAppendReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	// leader发现更高的term，更新term并转变为follower
 	if reply.Term > rf.currentTerm {
 		rf.mu.Lock()
-		rf.state = Follower
 		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.electionTimer.Reset(rf.getRandomElectionTimeout())
 		rf.mu.Unlock()
 	}
 	return ok
@@ -136,7 +136,7 @@ func (rf *Raft) getRandomElectionTimeout() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-// start leader election
+// 开始leader election
 func (rf *Raft) leaderElection() {
 	DPrintf("start election from id:%v\n", rf.me)
 
@@ -161,22 +161,25 @@ func (rf *Raft) leaderElection() {
 
 		// 必须并行执行投票请求
 		// 同步等待网络断开花销时间久，无法及时发送heartbeat建立leader权威，导致多个follower election time out，此时可能出现split votes的问题，导致无法选举出leader
-		go func(i int) {
+		go func(i int, term int) {
 			arg := &RequestVoteArgs{}
-			arg.Term = rf.currentTerm
+			arg.Term = term
 			arg.CandidateId = rf.me
 			rep := &RequestVoteReply{}
 			ok := rf.sendRequestVote(i, arg, rep)
 			if rep.Term > rf.currentTerm {
+				// candidate发现term更高的node，变为follower
 				rf.mu.Lock()
 				rf.currentTerm = rep.Term
 				rf.state = Follower
 				rf.mu.Unlock()
 			} else if ok == true && rep.VoteGranted == true {
+				// 获得vote
 				vote_lk.Lock()
 				votes = append(votes, i)
 				vote++
 
+				// 获得大部分vote，成为leader并发送heartbeat
 				if rf.isLeader() == false && vote > len(rf.peers)/2 {
 					DPrintf("establish election from id:%v: votes:%v\n", rf.me, votes)
 					rf.mu.Lock()
@@ -196,7 +199,7 @@ func (rf *Raft) leaderElection() {
 			n--
 			c.L.Unlock()
 			c.Broadcast()
-		}(i)
+		}(i, rf.currentTerm)
 	}
 
 	// 条件变量，能满足majorty votes时，提前返回
@@ -209,6 +212,7 @@ func (rf *Raft) leaderElection() {
 
 	if vote <= len(rf.peers)/2 {
 		DPrintf("fail establish election from id:%v: votes:%v\n", rf.me, votes)
-		rf.electionTimer.Reset(rf.getRandomElectionTimeout())
+		// 立刻开始下一轮选举
+		rf.electionTimer.Reset(0)
 	}
 }
